@@ -1,0 +1,758 @@
+package com.fuellens.application;
+
+import android.Manifest;
+import android.annotation.SuppressLint;
+import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.location.Location;
+import android.os.Bundle;
+import android.util.Log;
+import android.view.View;
+import android.widget.Button;
+import android.widget.ImageView;
+import android.widget.LinearLayout;
+import android.widget.ProgressBar;
+import android.widget.TextView;
+import android.widget.Toast;
+
+import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.app.ActivityCompat;
+
+import com.android.volley.Request;
+import com.android.volley.RequestQueue;
+import com.android.volley.toolbox.StringRequest;
+import com.android.volley.toolbox.Volley;
+import com.google.android.gms.common.api.ResolvableApiException;
+import com.google.android.gms.location.*;
+import com.google.android.gms.maps.*;
+import com.google.android.gms.maps.model.*;
+import com.google.android.gms.tasks.Task;
+import com.google.android.libraries.places.api.Places;
+import com.google.android.libraries.places.api.model.Place;
+import com.google.android.libraries.places.widget.Autocomplete;
+import com.google.android.libraries.places.widget.AutocompleteActivity;
+import com.google.android.libraries.places.widget.AutocompleteSupportFragment;
+import com.google.android.libraries.places.widget.listener.PlaceSelectionListener;
+import com.google.android.libraries.places.widget.model.AutocompleteActivityMode;
+import com.google.maps.android.PolyUtil;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.util.*;
+
+public class MainActivity extends AppCompatActivity implements OnMapReadyCallback {
+
+    private static final int PERMISSION_CODE = 1;
+    private static final int AUTOCOMPLETE_REQUEST_CODE = 1002;
+    private static final int LOCATION_SETTINGS_REQUEST = 1001;
+    private static final String TAG = "FuelFinderApp";
+
+    private GoogleMap mMap;
+    private FusedLocationProviderClient fusedLocationProviderClient;
+    private LatLng userLatLng;
+    private Marker userMarker;
+    private Circle userCircle;
+    private ImageView btnMyLocation, btnSearch, btnRefresh;
+    private Button btnLogin, btnSignup;
+    private AutocompleteSupportFragment autocompleteFragment;
+    private RequestQueue requestQueue;
+    private List<Marker> fuelStationMarkers = new ArrayList<>();
+    private Polyline currentRoute;
+    private ProgressBar progressBar;
+    private LinearLayout infoPanel;
+    private TextView tvStationCount, tvSearchRadius;
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_main);
+
+        // Initialize Places API with proper error handling
+        try {
+            if (!Places.isInitialized()) {
+                Places.initialize(getApplicationContext(), getString(R.string.MAPS_API_KEY));
+                Log.d(TAG, "Places API initialized successfully");
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Error initializing Places API", e);
+            Toast.makeText(this, "Error initializing location services", Toast.LENGTH_LONG).show();
+        }
+
+        // Initialize components
+        initializeViews();
+        initializeLocationServices();
+        initializeMap();
+        setupClickListeners();
+        setupAutoComplete();
+    }
+
+    private void initializeViews() {
+        btnMyLocation = findViewById(R.id.btnMyLocation);
+        btnSearch = findViewById(R.id.btnSearch);
+        btnRefresh = findViewById(R.id.btnRefresh);
+        btnLogin = findViewById(R.id.btnLogin);
+        btnSignup = findViewById(R.id.btnSignup);
+        progressBar = findViewById(R.id.progressBar);
+        infoPanel = findViewById(R.id.infoPanel);
+        tvStationCount = findViewById(R.id.tvStationCount);
+        tvSearchRadius = findViewById(R.id.tvSearchRadius);
+        requestQueue = Volley.newRequestQueue(this);
+    }
+
+    private void initializeLocationServices() {
+        fusedLocationProviderClient = LocationServices.getFusedLocationProviderClient(this);
+    }
+
+    private void initializeMap() {
+        SupportMapFragment mapFragment = (SupportMapFragment)
+                getSupportFragmentManager().findFragmentById(R.id.map);
+        if (mapFragment != null) {
+            mapFragment.getMapAsync(this);
+        }
+    }
+
+    private void setupClickListeners() {
+        btnMyLocation.setOnClickListener(v -> {
+            if (userLatLng != null) {
+                mMap.animateCamera(CameraUpdateFactory.newLatLngZoom(userLatLng, 15));
+            } else {
+                requestLocation();
+            }
+        });
+
+        btnSearch.setOnClickListener(v -> openPlaceAutocomplete());
+
+        btnRefresh.setOnClickListener(v -> {
+            clearMarkersAndRoutes();
+            if (userLatLng != null) {
+                showProgressBar(true);
+                getNearbyPumps(userLatLng);
+                Toast.makeText(this, "Refreshing fuel stations...", Toast.LENGTH_SHORT).show();
+            } else {
+                requestLocation();
+            }
+        });
+
+        btnLogin.setOnClickListener(v -> {
+            Intent intent = new Intent(MainActivity.this, LoginActivity.class);
+            startActivity(intent);
+        });
+
+        btnSignup.setOnClickListener(v -> {
+            Intent intent = new Intent(MainActivity.this, SignupActivity.class);
+            startActivity(intent);
+        });
+    }
+
+    private void setupAutoComplete() {
+        autocompleteFragment = (AutocompleteSupportFragment)
+                getSupportFragmentManager().findFragmentById(R.id.autocomplete_fragment);
+
+        if (autocompleteFragment != null) {
+            try {
+                // Set place fields
+                autocompleteFragment.setPlaceFields(Arrays.asList(
+                        Place.Field.ID, 
+                        Place.Field.NAME, 
+                        Place.Field.LAT_LNG, 
+                        Place.Field.ADDRESS,
+                        Place.Field.FORMATTED_ADDRESS
+                ));
+
+                // Set hint and styling
+                autocompleteFragment.setHint("Search for a location...");
+                
+                // Set country restriction (optional - you can remove this)
+                // autocompleteFragment.setCountries("IN");
+
+                autocompleteFragment.setOnPlaceSelectedListener(new PlaceSelectionListener() {
+                    @Override
+                    public void onPlaceSelected(@NonNull Place place) {
+                        Log.d(TAG, "Place selected: " + place.getName());
+                        if (place.getLatLng() != null) {
+                            LatLng selectedLocation = place.getLatLng();
+                            
+                            // Clear previous search results
+                            clearMarkersAndRoutes();
+                            
+                            // Move camera to selected location
+                            mMap.animateCamera(CameraUpdateFactory.newLatLngZoom(selectedLocation, 15));
+                            
+                            // Show progress
+                            showProgressBar(true);
+                            
+                            // Search for fuel stations at selected location
+                            getNearbyPumps(selectedLocation);
+
+                            // Add a temporary marker for searched location
+                            mMap.addMarker(new MarkerOptions()
+                                    .position(selectedLocation)
+                                    .title(place.getName() != null ? place.getName() : "Selected Location")
+                                    .snippet(place.getAddress() != null ? place.getAddress() : "")
+                                    .icon(BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_GREEN)));
+
+                            Toast.makeText(MainActivity.this, "Searching fuel stations near " + 
+                                place.getName(), Toast.LENGTH_SHORT).show();
+                        }
+                    }
+
+                    @Override
+                    public void onError(@NonNull com.google.android.gms.common.api.Status status) {
+                        Log.e(TAG, "Place selection error: " + status.getStatusMessage());
+                        Toast.makeText(MainActivity.this, "Error selecting place: " + 
+                            status.getStatusMessage(), Toast.LENGTH_SHORT).show();
+                    }
+                });
+
+                Log.d(TAG, "AutoComplete setup completed successfully");
+            } catch (Exception e) {
+                Log.e(TAG, "Error setting up autocomplete", e);
+                Toast.makeText(this, "Search functionality may not work properly", Toast.LENGTH_SHORT).show();
+            }
+        } else {
+            Log.e(TAG, "AutoComplete fragment not found");
+        }
+    }
+
+    private void openPlaceAutocomplete() {
+        try {
+            List<Place.Field> fields = Arrays.asList(
+                    Place.Field.ID, 
+                    Place.Field.NAME, 
+                    Place.Field.LAT_LNG, 
+                    Place.Field.ADDRESS,
+                    Place.Field.FORMATTED_ADDRESS
+            );
+
+            Intent intent = new Autocomplete.IntentBuilder(AutocompleteActivityMode.OVERLAY, fields)
+                    .build(this);
+            startActivityForResult(intent, AUTOCOMPLETE_REQUEST_CODE);
+        } catch (Exception e) {
+            Log.e(TAG, "Error opening place autocomplete", e);
+            Toast.makeText(this, "Search feature temporarily unavailable", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    @Override
+    public void onMapReady(@NonNull GoogleMap googleMap) {
+        this.mMap = googleMap;
+
+        // Configure map settings
+        mMap.getUiSettings().setMyLocationButtonEnabled(false);
+        mMap.getUiSettings().setZoomControlsEnabled(true);
+        mMap.getUiSettings().setCompassEnabled(true);
+        mMap.getUiSettings().setMapToolbarEnabled(false); // Disable to prevent conflicts
+
+        // Set map type
+        mMap.setMapType(GoogleMap.MAP_TYPE_NORMAL);
+
+        // Enable traffic layer
+        mMap.setTrafficEnabled(true);
+
+        // Enable location if permission granted
+        enableLocation();
+
+        // Set map click listener for selecting locations
+        mMap.setOnMapClickListener(latLng -> {
+            clearMarkersAndRoutes();
+            showProgressBar(true);
+            getNearbyPumps(latLng);
+
+            // Add a marker for clicked location
+            mMap.addMarker(new MarkerOptions()
+                    .position(latLng)
+                    .title("Selected Location")
+                    .snippet("Tap to search fuel stations here")
+                    .icon(BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_ORANGE)));
+
+            Toast.makeText(this, "Searching fuel stations at selected location...", Toast.LENGTH_SHORT).show();
+        });
+
+        // Set info window click listener for navigation
+        mMap.setOnInfoWindowClickListener(marker -> {
+            if (marker.getTag() instanceof FuelStationInfo) {
+                FuelStationInfo stationInfo = (FuelStationInfo) marker.getTag();
+                openFuelStationDetails(stationInfo, marker.getPosition());
+            } else if (userLatLng != null && !marker.equals(userMarker)) {
+                LatLng destination = marker.getPosition();
+                drawRoute(userLatLng, destination);
+            }
+        });
+
+        // Set marker click listener for custom info windows
+        mMap.setOnMarkerClickListener(marker -> {
+            if (marker.getTag() instanceof FuelStationInfo) {
+                marker.showInfoWindow();
+                return true;
+            }
+            return false;
+        });
+
+        Log.d(TAG, "Map ready and configured");
+    }
+
+    private void enableLocation() {
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+                != PackageManager.PERMISSION_GRANTED &&
+                ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION)
+                        != PackageManager.PERMISSION_GRANTED) {
+
+            ActivityCompat.requestPermissions(this,
+                    new String[]{
+                            Manifest.permission.ACCESS_FINE_LOCATION,
+                            Manifest.permission.ACCESS_COARSE_LOCATION
+                    }, PERMISSION_CODE);
+        } else {
+            requestLocation();
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private void requestLocation() {
+        LocationRequest locationRequest = LocationRequest.create()
+                .setPriority(Priority.PRIORITY_HIGH_ACCURACY)
+                .setInterval(10000)
+                .setFastestInterval(5000)
+                .setMaxWaitTime(15000);
+
+        LocationSettingsRequest.Builder builder = new LocationSettingsRequest.Builder()
+                .addLocationRequest(locationRequest)
+                .setAlwaysShow(true);
+
+        Task<LocationSettingsResponse> task = LocationServices.getSettingsClient(this)
+                .checkLocationSettings(builder.build());
+
+        task.addOnSuccessListener(locationSettingsResponse -> {
+            Log.d(TAG, "Location settings satisfied");
+            showProgressBar(true);
+            getDeviceLocation();
+        });
+
+        task.addOnFailureListener(e -> {
+            if (e instanceof ResolvableApiException) {
+                try {
+                    ResolvableApiException resolvable = (ResolvableApiException) e;
+                    resolvable.startResolutionForResult(MainActivity.this, LOCATION_SETTINGS_REQUEST);
+                } catch (Exception ex) {
+                    Log.e(TAG, "Error starting resolution for location settings", ex);
+                }
+            } else {
+                Toast.makeText(this, "Location settings cannot be satisfied", Toast.LENGTH_LONG).show();
+            }
+        });
+    }
+
+    @SuppressLint("MissingPermission")
+    private void getDeviceLocation() {
+        fusedLocationProviderClient.getLastLocation()
+                .addOnSuccessListener(location -> {
+                    if (location != null) {
+                        userLatLng = new LatLng(location.getLatitude(), location.getLongitude());
+                        showUserLocation(userLatLng);
+                        Log.d(TAG, "User location: " + userLatLng.toString());
+                    } else {
+                        Log.d(TAG, "Last known location is null, requesting current location");
+                        requestCurrentLocation();
+                    }
+                })
+                .addOnFailureListener(e -> {
+                    Log.e(TAG, "Failed to get last location", e);
+                    showProgressBar(false);
+                    Toast.makeText(this, "Unable to get current location", Toast.LENGTH_SHORT).show();
+                });
+    }
+
+    @SuppressLint("MissingPermission")
+    private void requestCurrentLocation() {
+        LocationRequest locationRequest = LocationRequest.create()
+                .setPriority(Priority.PRIORITY_HIGH_ACCURACY)
+                .setNumUpdates(1)
+                .setInterval(0);
+
+        fusedLocationProviderClient.requestLocationUpdates(locationRequest,
+                new LocationCallback() {
+                    @Override
+                    public void onLocationResult(@NonNull LocationResult locationResult) {
+                        Location location = locationResult.getLastLocation();
+                        if (location != null) {
+                            userLatLng = new LatLng(location.getLatitude(), location.getLongitude());
+                            showUserLocation(userLatLng);
+                        } else {
+                            showProgressBar(false);
+                        }
+                        fusedLocationProviderClient.removeLocationUpdates(this);
+                    }
+                }, getMainLooper());
+    }
+
+    private void showUserLocation(LatLng latLng) {
+        if (mMap == null) return;
+
+        // Remove existing user marker and circle
+        if (userMarker != null) userMarker.remove();
+        if (userCircle != null) userCircle.remove();
+
+        // Create custom marker icon for user location
+        try {
+            Bitmap icon = BitmapFactory.decodeResource(getResources(), R.drawable.ic_mylocation);
+            if (icon != null) {
+                Bitmap resizedIcon = Bitmap.createScaledBitmap(icon, 100, 100, false);
+                userMarker = mMap.addMarker(new MarkerOptions()
+                        .position(latLng)
+                        .title("Your Location")
+                        .snippet("You are here")
+                        .icon(BitmapDescriptorFactory.fromBitmap(resizedIcon)));
+            } else {
+                userMarker = mMap.addMarker(new MarkerOptions()
+                        .position(latLng)
+                        .title("Your Location")
+                        .snippet("You are here")
+                        .icon(BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_AZURE)));
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Error creating user marker", e);
+            userMarker = mMap.addMarker(new MarkerOptions()
+                    .position(latLng)
+                    .title("Your Location")
+                    .snippet("You are here"));
+        }
+
+        // Add circle to show search radius
+        userCircle = mMap.addCircle(new CircleOptions()
+                .center(latLng)
+                .radius(5000) // 5km radius
+                .strokeColor(0x550197F5)
+                .fillColor(0x115197F5)
+                .strokeWidth(3));
+
+        // Move camera to user location
+        mMap.animateCamera(CameraUpdateFactory.newLatLngZoom(latLng, 14));
+
+        // Search for nearby fuel pumps
+        getNearbyPumps(latLng);
+    }
+
+    private void getNearbyPumps(LatLng latLng) {
+        String url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json?" +
+                "location=" + latLng.latitude + "," + latLng.longitude +
+                "&radius=5000" +
+                "&type=gas_station" +
+                "&key=" + getString(R.string.MAPS_API_KEY);
+
+        StringRequest request = new StringRequest(Request.Method.GET, url,
+                response -> {
+                    try {
+                        JSONObject jsonResponse = new JSONObject(response);
+                        String status = jsonResponse.optString("status");
+                        
+                        if ("OK".equals(status)) {
+                            JSONArray results = jsonResponse.getJSONArray("results");
+
+                            // Clear existing fuel station markers
+                            clearFuelStationMarkers();
+
+                            Log.d(TAG, "Found " + results.length() + " fuel stations");
+
+                            for (int i = 0; i < results.length(); i++) {
+                                JSONObject place = results.getJSONObject(i);
+                                String name = place.getString("name");
+                                String placeId = place.optString("place_id");
+                                String vicinity = place.optString("vicinity", "");
+                                double rating = place.optDouble("rating", 0.0);
+                                int userRatingsTotal = place.optInt("user_ratings_total", 0);
+
+                                JSONObject geometry = place.getJSONObject("geometry");
+                                JSONObject location = geometry.getJSONObject("location");
+                                double lat = location.getDouble("lat");
+                                double lng = location.getDouble("lng");
+
+                                LatLng stationLocation = new LatLng(lat, lng);
+
+                                // Create fuel station info object
+                                FuelStationInfo stationInfo = new FuelStationInfo(
+                                    name, vicinity, rating, userRatingsTotal, placeId, stationLocation
+                                );
+
+                                // Create marker with custom icon
+                                Marker marker = createFuelStationMarker(stationLocation, stationInfo);
+                                if (marker != null) {
+                                    fuelStationMarkers.add(marker);
+                                }
+                            }
+
+                            // Update info panel
+                            updateInfoPanel(results.length());
+
+                            if (results.length() == 0) {
+                                Toast.makeText(this, "No fuel stations found within 5km", Toast.LENGTH_SHORT).show();
+                            } else {
+                                Toast.makeText(this, "Found " + results.length() + " fuel stations", Toast.LENGTH_SHORT).show();
+                            }
+                        } else {
+                            Log.e(TAG, "API returned status: " + status);
+                            Toast.makeText(this, "Error searching fuel stations", Toast.LENGTH_SHORT).show();
+                        }
+
+                    } catch (Exception e) {
+                        Log.e(TAG, "Error parsing fuel stations response", e);
+                        Toast.makeText(this, "Error loading fuel stations", Toast.LENGTH_SHORT).show();
+                    } finally {
+                        showProgressBar(false);
+                    }
+                },
+                error -> {
+                    Log.e(TAG, "Network error while fetching fuel stations", error);
+                    showProgressBar(false);
+                    Toast.makeText(this, "Network error. Please check your connection.", Toast.LENGTH_SHORT).show();
+                });
+
+        // Set timeout
+        request.setRetryPolicy(new com.android.volley.DefaultRetryPolicy(
+                15000, // 15 seconds timeout
+                1,
+                com.android.volley.DefaultRetryPolicy.DEFAULT_BACKOFF_MULT));
+
+        requestQueue.add(request);
+    }
+
+    private Marker createFuelStationMarker(LatLng location, FuelStationInfo stationInfo) {
+        try {
+            Bitmap fuelIcon = BitmapFactory.decodeResource(getResources(), R.drawable.fuel_icon);
+            
+            String snippet = stationInfo.vicinity;
+            if (stationInfo.rating > 0) {
+                snippet += "\nRating: " + String.format("%.1f", stationInfo.rating) + "?";
+                if (stationInfo.userRatingsTotal > 0) {
+                    snippet += " (" + stationInfo.userRatingsTotal + " reviews)";
+                }
+            }
+            snippet += "\nTap for details & navigation";
+
+            MarkerOptions markerOptions = new MarkerOptions()
+                    .position(location)
+                    .title(stationInfo.name)
+                    .snippet(snippet);
+
+            if (fuelIcon != null) {
+                Bitmap resizedIcon = Bitmap.createScaledBitmap(fuelIcon, 80, 80, false);
+                markerOptions.icon(BitmapDescriptorFactory.fromBitmap(resizedIcon));
+            } else {
+                markerOptions.icon(BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_RED));
+            }
+
+            Marker marker = mMap.addMarker(markerOptions);
+            marker.setTag(stationInfo);
+            return marker;
+
+        } catch (Exception e) {
+            Log.e(TAG, "Error creating fuel station marker", e);
+            return null;
+        }
+    }
+
+    private void openFuelStationDetails(FuelStationInfo stationInfo, LatLng position) {
+        Intent intent = new Intent(this, FuelStationDetailsActivity.class);
+        intent.putExtra("station_name", stationInfo.name);
+        intent.putExtra("station_address", stationInfo.vicinity);
+        intent.putExtra("station_rating", stationInfo.rating);
+        intent.putExtra("station_reviews", stationInfo.userRatingsTotal);
+        intent.putExtra("station_lat", position.latitude);
+        intent.putExtra("station_lng", position.longitude);
+        intent.putExtra("place_id", stationInfo.placeId);
+        if (userLatLng != null) {
+            intent.putExtra("user_lat", userLatLng.latitude);
+            intent.putExtra("user_lng", userLatLng.longitude);
+        }
+        startActivity(intent);
+    }
+
+    private void clearFuelStationMarkers() {
+        for (Marker marker : fuelStationMarkers) {
+            marker.remove();
+        }
+        fuelStationMarkers.clear();
+    }
+
+    private void clearMarkersAndRoutes() {
+        clearFuelStationMarkers();
+        if (currentRoute != null) {
+            currentRoute.remove();
+            currentRoute = null;
+        }
+        
+        // Clear all markers except user location
+        mMap.clear();
+        
+        // Re-add user location if available
+        if (userLatLng != null) {
+            showUserLocation(userLatLng);
+        }
+        
+        // Hide info panel
+        updateInfoPanel(0);
+    }
+
+    private void drawRoute(LatLng origin, LatLng destination) {
+        showProgressBar(true);
+        String url = "https://maps.googleapis.com/maps/api/directions/json?" +
+                "origin=" + origin.latitude + "," + origin.longitude +
+                "&destination=" + destination.latitude + "," + destination.longitude +
+                "&mode=driving" +
+                "&key=" + getString(R.string.MAPS_API_KEY);
+
+        StringRequest request = new StringRequest(Request.Method.GET, url,
+                response -> {
+                    try {
+                        JSONObject jsonResponse = new JSONObject(response);
+                        JSONArray routes = jsonResponse.getJSONArray("routes");
+
+                        if (routes.length() > 0) {
+                            // Remove existing route
+                            if (currentRoute != null) {
+                                currentRoute.remove();
+                            }
+
+                            JSONObject route = routes.getJSONObject(0);
+                            String encodedPolyline = route.getJSONObject("overview_polyline").getString("points");
+
+                            // Get route info
+                            JSONArray legs = route.getJSONArray("legs");
+                            if (legs.length() > 0) {
+                                JSONObject leg = legs.getJSONObject(0);
+                                String distance = leg.getJSONObject("distance").getString("text");
+                                String duration = leg.getJSONObject("duration").getString("text");
+
+                                Toast.makeText(this, "Distance: " + distance + ", Duration: " + duration,
+                                        Toast.LENGTH_LONG).show();
+                            }
+
+                            // Decode and draw polyline
+                            List<LatLng> path = PolyUtil.decode(encodedPolyline);
+                            currentRoute = mMap.addPolyline(new PolylineOptions()
+                                    .addAll(path)
+                                    .color(0xFF1976D2)
+                                    .width(8)
+                                    .pattern(Arrays.asList(new Dash(10), new Gap(5))));
+
+                            Log.d(TAG, "Route drawn successfully");
+                        } else {
+                            Toast.makeText(this, "No route found", Toast.LENGTH_SHORT).show();
+                        }
+
+                    } catch (Exception e) {
+                        Log.e(TAG, "Error parsing directions response", e);
+                        Toast.makeText(this, "Error drawing route", Toast.LENGTH_SHORT).show();
+                    } finally {
+                        showProgressBar(false);
+                    }
+                },
+                error -> {
+                    Log.e(TAG, "Network error while fetching directions", error);
+                    showProgressBar(false);
+                    Toast.makeText(this, "Network error while getting directions", Toast.LENGTH_SHORT).show();
+                });
+
+        requestQueue.add(request);
+    }
+
+    private void showProgressBar(boolean show) {
+        if (progressBar != null) {
+            progressBar.setVisibility(show ? View.VISIBLE : View.GONE);
+        }
+    }
+
+    private void updateInfoPanel(int stationCount) {
+        if (infoPanel != null && tvStationCount != null) {
+            if (stationCount > 0) {
+                tvStationCount.setText("Fuel Stations Found: " + stationCount);
+                infoPanel.setVisibility(View.VISIBLE);
+            } else {
+                infoPanel.setVisibility(View.GONE);
+            }
+        }
+    }
+
+    // Inner class to hold fuel station information
+    private static class FuelStationInfo {
+        String name;
+        String vicinity;
+        double rating;
+        int userRatingsTotal;
+        String placeId;
+        LatLng location;
+
+        FuelStationInfo(String name, String vicinity, double rating, int userRatingsTotal, String placeId, LatLng location) {
+            this.name = name;
+            this.vicinity = vicinity;
+            this.rating = rating;
+            this.userRatingsTotal = userRatingsTotal;
+            this.placeId = placeId;
+            this.location = location;
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, @Nullable Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+
+        if (requestCode == LOCATION_SETTINGS_REQUEST) {
+            if (resultCode == RESULT_OK) {
+                requestLocation();
+            } else {
+                Toast.makeText(this, "Location access is required for this app", Toast.LENGTH_LONG).show();
+            }
+        }
+
+        if (requestCode == AUTOCOMPLETE_REQUEST_CODE) {
+            if (resultCode == RESULT_OK && data != null) {
+                try {
+                    Place place = Autocomplete.getPlaceFromIntent(data);
+                    if (place.getLatLng() != null) {
+                        LatLng selectedLocation = place.getLatLng();
+                        
+                        // Clear previous results
+                        clearMarkersAndRoutes();
+                        showProgressBar(true);
+                        
+                        mMap.animateCamera(CameraUpdateFactory.newLatLngZoom(selectedLocation, 15));
+                        getNearbyPumps(selectedLocation);
+
+                        // Add marker for searched place
+                        mMap.addMarker(new MarkerOptions()
+                                .position(selectedLocation)
+                                .title(place.getName() != null ? place.getName() : "Selected Location")
+                                .snippet(place.getAddress() != null ? place.getAddress() : "")
+                                .icon(BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_GREEN)));
+                        
+                        Toast.makeText(this, "Searching fuel stations near " + place.getName(), Toast.LENGTH_SHORT).show();
+                    }
+                } catch (Exception e) {
+                    Log.e(TAG, "Error processing autocomplete result", e);
+                    Toast.makeText(this, "Error processing search result", Toast.LENGTH_SHORT).show();
+                }
+            } else if (resultCode == AutocompleteActivity.RESULT_ERROR && data != null) {
+                com.google.android.gms.common.api.Status status = Autocomplete.getStatusFromIntent(data);
+                Log.e(TAG, "Autocomplete error: " + status.getStatusMessage());
+                Toast.makeText(this, "Search error: " + status.getStatusMessage(), Toast.LENGTH_SHORT).show();
+            }
+        }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions,
+                                           @NonNull int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+
+        if (requestCode == PERMISSION_CODE) {
+            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                Log.d(TAG, "Location permission granted");
+                requestLocation();
+            } else {
+                Log.d(TAG, "Location permission denied");
+                Toast.makeText(this, "Location permission is required to find nearby fuel stations",
+                        Toast.LENGTH_LONG).show();
